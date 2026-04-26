@@ -1,0 +1,31 @@
+# Python
+backend/venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Django
+backend/staticfiles/
+backend/media/
+backend/db.sqlite3
+
+# Env
+.env
+*.local
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Claude / agent state
+.claude/

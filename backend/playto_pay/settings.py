@@ -1,0 +1,204 @@
+"""
+Django settings for the Playto payout engine.
+
+Configuration is environment-driven so the same code runs locally, in CI,
+and on Railway.
+"""
+
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+load_dotenv(BASE_DIR / ".env")
+
+
+def env(name: str, default: str | None = None, *, required: bool = False) -> str:
+    value = os.environ.get(name, default)
+    if required and value in (None, ""):
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value  # type: ignore[return-value]
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+SECRET_KEY = env("DJANGO_SECRET_KEY", "dev-only-secret-do-not-use-in-prod")
+DEBUG = env_bool("DJANGO_DEBUG", default=True)
+
+ALLOWED_HOSTS = [h.strip() for h in env("DJANGO_ALLOWED_HOSTS", "*").split(",") if h.strip()]
+CSRF_TRUSTED_ORIGINS = [
+    o.strip() for o in env("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if o.strip()
+]
+
+INSTALLED_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    "rest_framework",
+    "corsheaders",
+    "django_celery_beat",
+    "merchants",
+    "payouts",
+]
+
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+]
+
+ROOT_URLCONF = "playto_pay.urls"
+
+TEMPLATES = [
+    {
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.debug",
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
+            ],
+        },
+    },
+]
+
+WSGI_APPLICATION = "playto_pay.wsgi.application"
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": env("POSTGRES_DB", "playto_pay"),
+        "USER": env("POSTGRES_USER", os.environ.get("USER", "postgres")),
+        "PASSWORD": env("POSTGRES_PASSWORD", ""),
+        "HOST": env("POSTGRES_HOST", "127.0.0.1"),
+        "PORT": env("POSTGRES_PORT", "5432"),
+        "CONN_MAX_AGE": int(env("POSTGRES_CONN_MAX_AGE", "60")),
+        "OPTIONS": {
+            # READ COMMITTED is the Postgres default. It is enough for our
+            # locking model: every balance mutation runs inside transaction.atomic
+            # with SELECT ... FOR UPDATE on the merchant row, which serialises the
+            # critical section per merchant.
+        },
+    }
+}
+
+# DATABASE_URL overrides individual fields when present (Railway sets this).
+DATABASE_URL = env("DATABASE_URL", "")
+if DATABASE_URL:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(DATABASE_URL)
+    DATABASES["default"].update(
+        {
+            "NAME": parsed.path.lstrip("/"),
+            "USER": parsed.username or "",
+            "PASSWORD": parsed.password or "",
+            "HOST": parsed.hostname or "",
+            "PORT": str(parsed.port or 5432),
+        }
+    )
+
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
+
+LANGUAGE_CODE = "en-us"
+TIME_ZONE = "UTC"
+USE_I18N = True
+USE_TZ = True
+
+STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+REST_FRAMEWORK = {
+    "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.LimitOffsetPagination",
+    "PAGE_SIZE": 50,
+    "DEFAULT_THROTTLE_CLASSES": [],
+    "DEFAULT_AUTHENTICATION_CLASSES": [],
+    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
+}
+
+CORS_ALLOW_ALL_ORIGINS = env_bool("CORS_ALLOW_ALL_ORIGINS", default=DEBUG)
+CORS_ALLOWED_ORIGINS = [
+    o.strip() for o in env("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
+CORS_ALLOW_HEADERS = [
+    "accept",
+    "accept-encoding",
+    "authorization",
+    "content-type",
+    "dnt",
+    "origin",
+    "user-agent",
+    "x-csrftoken",
+    "x-requested-with",
+    "idempotency-key",
+    "x-merchant-id",
+]
+
+CELERY_BROKER_URL = env("CELERY_BROKER_URL", "redis://127.0.0.1:6379/0")
+CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", "redis://127.0.0.1:6379/1")
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_ACKS_LATE = True
+CELERY_TASK_REJECT_ON_WORKER_LOST = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_TIMEZONE = "UTC"
+CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+
+# Domain knobs — kept here so they can be tuned without touching code paths.
+PAYOUT_PROCESSING_TIMEOUT_SECONDS = int(env("PAYOUT_PROCESSING_TIMEOUT_SECONDS", "30"))
+PAYOUT_MAX_RETRIES = int(env("PAYOUT_MAX_RETRIES", "3"))
+IDEMPOTENCY_KEY_TTL_HOURS = int(env("IDEMPOTENCY_KEY_TTL_HOURS", "24"))
+BANK_SIMULATION_SUCCESS = float(env("BANK_SIMULATION_SUCCESS", "0.70"))
+BANK_SIMULATION_FAILURE = float(env("BANK_SIMULATION_FAILURE", "0.20"))
+# 0.10 hang implied by remainder. (success + failure + hang == 1.0)
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "format": "[{asctime}] {levelname} {name}: {message}",
+            "style": "{",
+        }
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "default",
+        }
+    },
+    "root": {"handlers": ["console"], "level": "INFO"},
+    "loggers": {
+        "playto": {"handlers": ["console"], "level": "DEBUG", "propagate": False},
+        "celery": {"handlers": ["console"], "level": "INFO", "propagate": False},
+    },
+}
