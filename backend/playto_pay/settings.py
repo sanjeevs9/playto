@@ -93,22 +93,25 @@ WSGI_APPLICATION = "playto_pay.wsgi.application"
 #   2. Otherwise, individual POSTGRES_* env vars (the local-dev path used by
 #      docker-compose).
 #
-# Isolation level is pinned at the connection layer (libpq ``options``).
-# READ COMMITTED is Postgres's default today, but pinning makes the contract
-# explicit: every transaction this app opens uses READ COMMITTED. Our locking
-# story (``SELECT ... FOR UPDATE`` on the merchant row) is designed for that
-# isolation level; pinning defends against a future server-side default
-# change.
+# Isolation level: we rely on Postgres's default of READ COMMITTED, which is
+# what our locking story (``SELECT ... FOR UPDATE`` on the merchant row) is
+# designed for.
+#
+# In an earlier revision we explicitly pinned this via libpq's ``options``
+# startup parameter ("-c default_transaction_isolation=read committed") so
+# the contract did not depend on a server-side default. We had to remove
+# that: Neon's PgBouncer pooler (the pooled connection mode) rejects the
+# ``options`` startup parameter — see
+# https://neon.tech/docs/connect/connection-errors#unsupported-startup-parameter.
+# The two ways out were (a) switch to the unpooled Neon URL (would exhaust
+# Postgres connections under our worker fan-out), or (b) drop the pin and
+# document the dependency. We chose (b).
+#
+# A non-pooled deploy (RDS, self-hosted) could re-add the pin via
+# ``OPTIONS["options"]``; the lock semantics are unchanged either way.
 import dj_database_url
 
-_PG_OPTIONS = {
-    # libpq has no string-quoting in the ``options`` parameter — only
-    # backslash escaping. The Python string ``"read\\ committed"`` becomes
-    # ``read\ committed`` on the wire, which libpq parses as the single
-    # token ``read committed``. Verify with ``manage.py dbshell`` then
-    # ``SHOW transaction_isolation;`` -> should return ``read committed``.
-    "options": "-c default_transaction_isolation=read\\ committed",
-}
+_PG_OPTIONS: dict = {}
 
 # CONN_MAX_AGE default is 0 — close the DB connection after each request.
 # Rationale: in this stack we run gunicorn (web) + Celery worker + Celery beat,
