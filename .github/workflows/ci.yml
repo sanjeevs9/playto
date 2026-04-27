@@ -39,8 +39,15 @@ jobs:
           --health-retries 10
 
     env:
+      # DEBUG=true in CI on purpose: the production SECURE_SSL_REDIRECT we
+      # set in settings.py (gated on `not DEBUG`) would redirect every
+      # http://testserver/* request to https://, which Django's test client
+      # cannot follow. Tests verify application correctness; the
+      # production-mode security block is exercised by hand on the live
+      # deploy (Render terminates TLS at the edge, so the redirect is a
+      # no-op in practice there).
       DJANGO_SECRET_KEY: ci-only-secret
-      DJANGO_DEBUG: "false"
+      DJANGO_DEBUG: "true"
       DJANGO_ALLOWED_HOSTS: "*"
       POSTGRES_HOST: 127.0.0.1
       POSTGRES_PORT: "5432"
