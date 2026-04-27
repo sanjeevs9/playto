@@ -83,39 +83,55 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "playto_pay.wsgi.application"
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": env("POSTGRES_DB", "playto_pay"),
-        "USER": env("POSTGRES_USER", os.environ.get("USER", "postgres")),
-        "PASSWORD": env("POSTGRES_PASSWORD", ""),
-        "HOST": env("POSTGRES_HOST", "127.0.0.1"),
-        "PORT": env("POSTGRES_PORT", "5432"),
-        "CONN_MAX_AGE": int(env("POSTGRES_CONN_MAX_AGE", "60")),
-        "OPTIONS": {
-            # READ COMMITTED is the Postgres default. It is enough for our
-            # locking model: every balance mutation runs inside transaction.atomic
-            # with SELECT ... FOR UPDATE on the merchant row, which serialises the
-            # critical section per merchant.
-        },
-    }
+# --- Database --------------------------------------------------------------
+#
+# Two paths in priority order:
+#   1. DATABASE_URL (Railway, Render, Fly all set this) -> dj_database_url.
+#      The library handles URL-encoded passwords (we have hit `@`, `:`, `%`
+#      in real Railway-rotated passwords), preserves ``sslmode=require`` query
+#      params Railway appends, and accepts both ``postgres://`` and
+#      ``postgresql://`` schemes.
+#   2. Otherwise, individual POSTGRES_* env vars (the local-dev path used by
+#      docker-compose).
+#
+# Isolation level is pinned at the connection layer (libpq ``options``).
+# READ COMMITTED is Postgres's default today, but pinning makes the contract
+# explicit: every transaction this app opens uses READ COMMITTED. Our locking
+# story (``SELECT ... FOR UPDATE`` on the merchant row) is designed for that
+# isolation level; pinning defends against a future server-side default
+# change.
+import dj_database_url
+
+_PG_OPTIONS = {
+    # libpq has no string-quoting in the ``options`` parameter — only
+    # backslash escaping. The Python string ``"read\\ committed"`` becomes
+    # ``read\ committed`` on the wire, which libpq parses as the single
+    # token ``read committed``. Verify with ``manage.py dbshell`` then
+    # ``SHOW transaction_isolation;`` -> should return ``read committed``.
+    "options": "-c default_transaction_isolation=read\\ committed",
 }
 
-# DATABASE_URL overrides individual fields when present (Railway sets this).
-DATABASE_URL = env("DATABASE_URL", "")
-if DATABASE_URL:
-    from urllib.parse import urlparse
-
-    parsed = urlparse(DATABASE_URL)
-    DATABASES["default"].update(
-        {
-            "NAME": parsed.path.lstrip("/"),
-            "USER": parsed.username or "",
-            "PASSWORD": parsed.password or "",
-            "HOST": parsed.hostname or "",
-            "PORT": str(parsed.port or 5432),
+if env("DATABASE_URL", ""):
+    DATABASES = {
+        "default": dj_database_url.config(
+            conn_max_age=int(env("POSTGRES_CONN_MAX_AGE", "60")),
+            conn_health_checks=True,
+        ),
+    }
+    DATABASES["default"].setdefault("OPTIONS", {}).update(_PG_OPTIONS)
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": env("POSTGRES_DB", "playto_pay"),
+            "USER": env("POSTGRES_USER", os.environ.get("USER", "postgres")),
+            "PASSWORD": env("POSTGRES_PASSWORD", ""),
+            "HOST": env("POSTGRES_HOST", "127.0.0.1"),
+            "PORT": env("POSTGRES_PORT", "5432"),
+            "CONN_MAX_AGE": int(env("POSTGRES_CONN_MAX_AGE", "60")),
+            "OPTIONS": _PG_OPTIONS,
         }
-    )
+    }
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},

@@ -74,6 +74,15 @@ class LedgerEntry(models.Model):
     )
     amount_paise = models.BigIntegerField()
     entry_type = models.CharField(max_length=16, choices=EntryType.choices)
+    related_payout = models.ForeignKey(
+        # Forward string reference — Payout lives in the payouts app and we
+        # want LedgerEntry definable without importing that module.
+        "payouts.Payout",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="ledger_entries",
+    )
     description = models.CharField(max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
