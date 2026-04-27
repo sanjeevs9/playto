@@ -111,10 +111,19 @@ _PG_OPTIONS = {
     "options": "-c default_transaction_isolation=read\\ committed",
 }
 
+# CONN_MAX_AGE default is 0 — close the DB connection after each request.
+# Rationale: in this stack we run gunicorn (web) + Celery worker + Celery beat,
+# all without a connection pooler. Each process holding persistent connections
+# would compound (~13 idle floor for 2 web + 4 worker + 1 beat) against
+# Postgres's max_connections=100 default and exhaust the pool under burst load.
+# Per-request connections are slightly slower per-request but eliminate the
+# pool-exhaustion failure mode. With PgBouncer in front we'd raise this.
+_PG_CONN_MAX_AGE = int(env("POSTGRES_CONN_MAX_AGE", "0"))
+
 if env("DATABASE_URL", ""):
     DATABASES = {
         "default": dj_database_url.config(
-            conn_max_age=int(env("POSTGRES_CONN_MAX_AGE", "60")),
+            conn_max_age=_PG_CONN_MAX_AGE,
             conn_health_checks=True,
         ),
     }
@@ -128,7 +137,7 @@ else:
             "PASSWORD": env("POSTGRES_PASSWORD", ""),
             "HOST": env("POSTGRES_HOST", "127.0.0.1"),
             "PORT": env("POSTGRES_PORT", "5432"),
-            "CONN_MAX_AGE": int(env("POSTGRES_CONN_MAX_AGE", "60")),
+            "CONN_MAX_AGE": _PG_CONN_MAX_AGE,
             "OPTIONS": _PG_OPTIONS,
         }
     }
@@ -182,12 +191,38 @@ CORS_ALLOW_HEADERS = [
 CELERY_BROKER_URL = env("CELERY_BROKER_URL", "redis://127.0.0.1:6379/0")
 CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", "redis://127.0.0.1:6379/1")
 CELERY_TASK_TRACK_STARTED = True
+# acks_late + reject_on_worker_lost: if a worker dies mid-task, the broker
+# re-delivers the message instead of acking it as done. Combined with
+# prefetch=1 this means we lose at most one in-flight task per worker death,
+# rather than the prefetch buffer.
 CELERY_TASK_ACKS_LATE = True
 CELERY_TASK_REJECT_ON_WORKER_LOST = True
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_TIMEZONE = "UTC"
-CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+# Hard + soft time limits prevent a hung bank-API call (in production: a real
+# external HTTP request) from holding a worker forever. The soft limit raises
+# SoftTimeLimitExceeded which our task can clean up; the hard limit kills the
+# worker process if it ignores the soft signal.
+CELERY_TASK_TIME_LIMIT = int(env("CELERY_TASK_TIME_LIMIT", "60"))
+CELERY_TASK_SOFT_TIME_LIMIT = int(env("CELERY_TASK_SOFT_TIME_LIMIT", "50"))
+
+CELERY_BEAT_SCHEDULE = {
+    # Sweep PROCESSING payouts older than the timeout and dispatch retries.
+    # Schedule runs every 10 seconds; the cutoff inside the task is
+    # PAYOUT_PROCESSING_TIMEOUT_SECONDS (default 30s).
+    "retry-stuck-payouts": {
+        "task": "payouts.retry_stuck_payouts",
+        "schedule": 10.0,
+    },
+    # Hourly cleanup of expired idempotency keys. The TTL itself
+    # (IDEMPOTENCY_KEY_TTL_HOURS, default 24h) is recorded on each row at
+    # write time; this task only deletes rows whose expires_at has passed.
+    "cleanup-expired-idempotency-keys": {
+        "task": "payouts.cleanup_idempotency_keys",
+        "schedule": 3600.0,
+    },
+}
 
 # Domain knobs — kept here so they can be tuned without touching code paths.
 PAYOUT_PROCESSING_TIMEOUT_SECONDS = int(env("PAYOUT_PROCESSING_TIMEOUT_SECONDS", "30"))

@@ -160,4 +160,4 @@ class IdempotencyKey(models.Model):
         ]
 
     def __str__(self) -> str:
-        return f"IdempotencyKey({self.merchant_id}, {self.key}, {self.status})"
+        return f"IdempotencyKey(merchant={self.merchant_id}, key={self.key})"

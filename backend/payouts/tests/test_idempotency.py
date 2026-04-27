@@ -10,13 +10,15 @@ Three scenarios cover the take-home spec verbatim:
 
 import threading
 import uuid
+from datetime import timedelta
 
 import pytest
 from django.db import connections
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from merchants.models import BankAccount, LedgerEntry, Merchant
-from payouts.models import Payout
+from payouts.models import IdempotencyKey, Payout
 
 
 def _make_merchant(*, balance_paise: int = 100_000, email: str = "idem@example.com"):
@@ -205,6 +207,26 @@ def test_idempotency_keys_are_scoped_per_merchant():
     assert r_a.json()["id"] != r_b.json()["id"]
     assert Payout.objects.filter(merchant=merchant_a).count() == 1
     assert Payout.objects.filter(merchant=merchant_b).count() == 1
+
+
+@pytest.mark.django_db
+def test_idempotency_key_repr_does_not_reference_dropped_columns():
+    """Regression: ``IdempotencyKey.__str__`` once interpolated ``self.status``
+    after the column had been dropped in migration 0002. Any caller — the
+    admin list view, a ``logger.info(f"... {idem}")`` line, or a Python
+    traceback formatter — would raise ``AttributeError``. ``__str__`` must be
+    safe to call on every persisted row.
+    """
+    merchant, _ = _make_merchant(email="repr-regression@example.com")
+    ik = IdempotencyKey.objects.create(
+        merchant=merchant,
+        key=uuid.uuid4(),
+        request_hash="0" * 64,
+        expires_at=timezone.now() + timedelta(hours=1),
+    )
+    s = str(ik)  # must not raise
+    assert "merchant" in s
+    assert str(merchant.id) in s
 
 
 @pytest.mark.django_db(transaction=True)
