@@ -21,6 +21,14 @@ node_modules/
 frontend/dist/
 frontend/.vite/
 
+# Celery beat scheduler artefacts (file-based PersistentScheduler)
+celerybeat-schedule
+celerybeat-schedule.*
+celerybeat.pid
+backend/celerybeat-schedule
+backend/celerybeat-schedule.*
+backend/celerybeat.pid
+
 # IDE
 .idea/
 .vscode/

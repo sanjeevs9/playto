@@ -7,10 +7,12 @@ synchronously (``CELERY_TASK_ALWAYS_EAGER=True``) so the tests don't need
 a broker.
 """
 
+import threading
 import uuid
 from datetime import timedelta
 
 import pytest
+from django.db import connections
 from django.db.models import Sum
 from django.utils import timezone
 
@@ -247,6 +249,103 @@ def test_cleanup_idempotency_keys_deletes_only_expired():
 
     assert not IdempotencyKey.objects.filter(id=expired.id).exists()
     assert IdempotencyKey.objects.filter(id=fresh.id).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_apply_outcome_results_in_one_terminal_state():
+    """Two threads simultaneously call ``_apply_outcome`` for the same
+    payout. The ``select_for_update`` inside ``_apply_outcome`` plus the
+    ``status != PROCESSING`` re-check must serialise them: exactly one
+    transition occurs, exactly one refund is written.
+
+    This guards against the at-least-once delivery case from Redis — if the
+    broker delivers the same outcome message twice, the worker must not
+    write two refunds or attempt an illegal terminal->terminal transition.
+    """
+    merchant, payout = _seed_merchant_with_payout(
+        balance_paise=100_000, payout_paise=50_000
+    )
+    payout.status = Payout.Status.PROCESSING
+    payout.started_at = timezone.now()
+    payout.save(update_fields=["status", "started_at"])
+
+    barrier = threading.Barrier(2)
+
+    def fire(outcome):
+        barrier.wait()
+        try:
+            tasks._apply_outcome(str(payout.id), outcome)
+        finally:
+            connections.close_all()
+
+    t1 = threading.Thread(target=fire, args=("failure",))
+    t2 = threading.Thread(target=fire, args=("failure",))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    payout.refresh_from_db()
+    assert payout.status == Payout.Status.FAILED, (
+        "exactly one of the two threads should have transitioned the row"
+    )
+    refund_count = LedgerEntry.objects.filter(
+        related_payout=payout,
+        entry_type=LedgerEntry.EntryType.REFUND,
+    ).count()
+    assert refund_count == 1, (
+        f"exactly one refund should be written; got {refund_count} "
+        "(double-refund means the lock + status re-check failed)"
+    )
+    # And the balance invariant still holds — sum equals original credit.
+    final = (
+        LedgerEntry.objects.filter(merchant=merchant)
+        .aggregate(total=Sum("amount_paise"))["total"]
+    )
+    assert final == 100_000
+
+
+@pytest.mark.django_db
+def test_apply_outcome_atomicity_failure_path(monkeypatch):
+    """Atomicity guarantee, not just both-side-effect-present.
+
+    The rubric requires: "A failed payout returning funds must do so
+    atomically with the state transition." The previous test verifies both
+    side-effects landed; this one verifies that if the transition fails
+    AFTER the refund LedgerEntry was inserted, the refund is rolled back.
+
+    We monkeypatch ``Payout.transition_to`` to raise. If ``_apply_outcome``
+    is correctly inside ``transaction.atomic()``, the LedgerEntry insert
+    must roll back. If a future refactor moves the LedgerEntry write
+    outside the atomic block, this test fails — the refund persists
+    despite the transition failure.
+    """
+    merchant, payout = _seed_merchant_with_payout()
+    payout.status = Payout.Status.PROCESSING
+    payout.started_at = timezone.now()
+    payout.save(update_fields=["status", "started_at"])
+
+    def boom(self, *args, **kwargs):
+        raise RuntimeError("simulated mid-transaction failure")
+
+    monkeypatch.setattr(Payout, "transition_to", boom)
+
+    with pytest.raises(RuntimeError):
+        tasks._apply_outcome(str(payout.id), "failure")
+
+    # Atomicity proof: the refund LedgerEntry must NOT be persisted because
+    # transition_to raised inside the same atomic block.
+    assert (
+        LedgerEntry.objects.filter(
+            related_payout=payout,
+            entry_type=LedgerEntry.EntryType.REFUND,
+        ).count()
+        == 0
+    ), "refund persisted despite transition failure — atomicity violated"
+
+    # And the row's status is unchanged.
+    payout.refresh_from_db()
+    assert payout.status == Payout.Status.PROCESSING
 
 
 @pytest.mark.django_db

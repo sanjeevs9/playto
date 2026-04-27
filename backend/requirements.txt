@@ -4,7 +4,6 @@ psycopg[binary]==3.2.3
 dj-database-url==2.3.0
 celery==5.4.0
 redis==5.2.1
-django-celery-beat==2.7.0
 django-cors-headers==4.6.0
 python-dotenv==1.0.1
 gunicorn==23.0.0

@@ -159,26 +159,61 @@ def retry_stuck_payouts() -> None:
 
     Exponential backoff is implemented via Celery's ``countdown`` so we do
     not have to sleep inside this task or rely on a separate scheduler.
+
+    De-duplication strategy:
+        Beat fires every 10s but the timeout is 30s. Without a guard, the
+        same hung row would be picked up at t=30/40/50, queueing three
+        ``retry_payout`` messages — each consuming a retry attempt. To get
+        the spec's "fair 3 attempts spaced over time" behaviour we:
+
+          1. ``SELECT ... FOR UPDATE SKIP LOCKED`` the stuck rows under a
+             transaction. ``skip_locked=True`` lets parallel sweeper
+             instances cooperate — each picks a disjoint subset.
+          2. ``UPDATE started_at = now()`` on the matched rows BEFORE
+             queueing the per-row retry. The next 10-second sweep tick
+             sees ``started_at >= cutoff`` for these rows and skips them
+             until the timeout passes again — at which point ``retry_payout``
+             will have fired (and reset ``started_at`` itself), so the
+             dedup is naturally maintained.
+
+    Production note: with a true distributed deployment we'd also want a
+    Redis lock or unique task-name to keep two beat schedulers from each
+    firing this task simultaneously — but that's a deploy-side concern
+    outside this take-home's scope.
     """
     cutoff = timezone.now() - timedelta(
         seconds=settings.PAYOUT_PROCESSING_TIMEOUT_SECONDS
     )
-    stuck = list(
-        Payout.objects.filter(
-            status=Payout.Status.PROCESSING,
-            started_at__lt=cutoff,
-        ).values_list("id", "retry_count")
-    )
+    now = timezone.now()
 
-    if not stuck:
-        return
+    with transaction.atomic():
+        stuck = list(
+            Payout.objects.select_for_update(skip_locked=True)
+            .filter(
+                status=Payout.Status.PROCESSING,
+                started_at__lt=cutoff,
+            )
+            .only("id", "retry_count")
+        )
+
+        if not stuck:
+            return
+
+        # Bump started_at INSIDE the same transaction. The next sweep tick
+        # will see started_at = now and skip these rows until the timeout
+        # passes again. retry_payout itself also resets started_at; if the
+        # retry fires before the next sweep, that reset is a no-op (already
+        # within the timeout window).
+        Payout.objects.filter(id__in=[p.id for p in stuck]).update(
+            started_at=now
+        )
 
     logger.info("retry_stuck_payouts: %d payout(s) to retry", len(stuck))
-    for payout_id, retry_count in stuck:
+    for payout in stuck:
         # Backoff sequence for retries 1..MAX is 2^1, 2^2, 2^3 = 2, 4, 8 seconds.
-        backoff_seconds = 2 ** (retry_count + 1)
+        backoff_seconds = 2 ** (payout.retry_count + 1)
         retry_payout.apply_async(
-            args=[str(payout_id)],
+            args=[str(payout.id)],
             countdown=backoff_seconds,
         )
 
