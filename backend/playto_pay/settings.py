@@ -157,6 +157,15 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
+# Single-origin SPA deploy: include the frontend's Vite build output in
+# STATICFILES_DIRS so ``collectstatic`` copies it into ``staticfiles/`` and
+# WhiteNoise serves it at ``/static/``. The Vite ``base`` config is
+# ``"/static/"`` in production builds (see ``frontend/vite.config.ts``), so
+# the asset URLs in ``index.html`` line up with what WhiteNoise serves.
+# In dev the directory may not exist; the conditional avoids a noisy warning.
+_FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"
+STATICFILES_DIRS = [_FRONTEND_DIST] if _FRONTEND_DIST.exists() else []
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 REST_FRAMEWORK = {
@@ -186,6 +195,26 @@ CORS_ALLOW_HEADERS = [
     "idempotency-key",
     "x-merchant-id",
 ]
+
+# --- Production security headers (gated on !DEBUG) ----------------------
+# Enabled when DJANGO_DEBUG is false. Dev-time runs unaffected. Each setting
+# is the standard Django/OWASP-recommended value for a money-moving service
+# behind an HTTPS-terminating proxy (Railway / Render / Fly all do TLS
+# termination at the edge).
+if not DEBUG:
+    # Trust the proxy's X-Forwarded-Proto so SSL_REDIRECT works from behind
+    # a TLS-terminating load balancer (Railway sets this header for us).
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SECURE_SSL_REDIRECT = True
+    # 1-year HSTS with subdomain inclusion + preload eligibility.
+    SECURE_HSTS_SECONDS = 31_536_000
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+    X_FRAME_OPTIONS = "DENY"
+    SECURE_CONTENT_TYPE_NOSNIFF = True
 
 CELERY_BROKER_URL = env("CELERY_BROKER_URL", "redis://127.0.0.1:6379/0")
 CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", "redis://127.0.0.1:6379/1")

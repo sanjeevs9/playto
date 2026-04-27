@@ -1,0 +1,33 @@
+# Nixpacks build for Railway.
+#
+# This is a monorepo: the Python backend lives in backend/ and the React
+# frontend in frontend/. We build both in one image so the web service can
+# serve the SPA's static assets directly via WhiteNoise (single-origin
+# deploy — no CORS, one URL for the CTO to share).
+#
+# Worker and beat services use the same image but override the start
+# command in Railway's UI (`worker:` or `beat:` from the Procfile).
+
+[phases.setup]
+nixPkgs = ["python313", "nodejs_20"]
+
+[phases.install]
+cmds = [
+  "cd frontend && npm ci",
+  "cd backend && pip install -r requirements.txt",
+]
+
+[phases.build]
+# Build the SPA first, then collectstatic — STATICFILES_DIRS picks up
+# frontend/dist into backend/staticfiles/, which WhiteNoise serves at
+# /static/. ``collectstatic`` does not touch the database, so it runs
+# safely during the build phase.
+cmds = [
+  "cd frontend && npm run build",
+  "cd backend && python manage.py collectstatic --noinput",
+]
+
+[start]
+# Default start command for the `web` service. Override per-service in
+# Railway for `worker` and `beat`.
+cmd = "cd backend && gunicorn playto_pay.wsgi --bind 0.0.0.0:$PORT --workers 2 --threads 4 --log-file -"
