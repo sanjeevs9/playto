@@ -139,15 +139,25 @@ The same primitive is used inline in `backend/payouts/services.py:125-128` for t
 
 When two transactions try to lock the same merchant row, Postgres blocks the second one at the lock acquisition. It waits — not spins, not polls — until the first transaction either commits or rolls back. After commit, the second transaction's balance recomputation sees the new DEBIT and correctly raises `InsufficientFundsError` if the remaining balance no longer covers the request.
 
-The isolation level for this contract is **READ COMMITTED**, pinned at the libpq layer rather than relied on as a server default — `backend/playto_pay/settings.py:_PG_OPTIONS`:
+The isolation level for this contract is **READ COMMITTED**, which is Postgres's server-side default. The lock semantics in `hold_funds` (and the worker's `_apply_outcome`) are designed for that level: every `select_for_update` runs inside `transaction.atomic()`, so the second transaction sees a fresh read after the first commits.
+
+An earlier revision pinned this explicitly via libpq's `options` startup parameter (`-c default_transaction_isolation=read committed`) so the contract did not depend on a server default. We removed it during the live deploy: Neon's PgBouncer pooler refuses the `options` startup parameter in transaction-pooled mode (see [Neon docs](https://neon.tech/docs/connect/connection-errors#unsupported-startup-parameter)). The two ways out were (a) switch to Neon's unpooled URL — would exhaust Postgres connections under our worker fan-out — or (b) drop the explicit pin and document the dependency. We chose (b). The current shape at `backend/playto_pay/settings.py:96-115`:
 
 ```python
-_PG_OPTIONS = {
-    "options": "-c default_transaction_isolation=read\\ committed",
-}
+# Isolation level: we rely on Postgres's default of READ COMMITTED, which is
+# what our locking story (``SELECT ... FOR UPDATE`` on the merchant row) is
+# designed for.
+#
+# In an earlier revision we explicitly pinned this via libpq's ``options``
+# startup parameter ... We had to remove that: Neon's PgBouncer pooler
+# rejects the ``options`` startup parameter ...
+#
+# A non-pooled deploy (RDS, self-hosted) could re-add the pin via
+# ``OPTIONS["options"]``; the lock semantics are unchanged either way.
+_PG_OPTIONS: dict = {}
 ```
 
-Verified at the wire by `manage.py dbshell` then `SHOW transaction_isolation;` returning `read committed`. Pinning makes the design contract explicit: every transaction this app opens negotiates READ COMMITTED at session start, regardless of what the cluster default is. A future deploy that changes the server-side default cannot silently shift our lock semantics.
+The full reasoning is in `notes/improvements-log.md` Entry 6 (added during deploy). On a non-pooled Postgres (RDS, self-hosted) we'd re-add the explicit pin — the lock semantics don't change either way, but defending against server-side default drift is good fintech hygiene.
 
 ### Why this works for "two simultaneous 60₹ payouts on a 100₹ balance"
 

@@ -125,7 +125,7 @@ All requests below are unauthenticated for the take-home; production would scope
 
 - **Backend**: Django 5.1, DRF 3.15, Celery 5.4, psycopg 3.2, PostgreSQL 14+. Settings are env-driven; `dj-database-url` parses `DATABASE_URL` for Railway/Render deploys.
 - **Frontend**: Vite + React 19 + TypeScript, Tailwind 3, TanStack Query 5 with 3-second polling, axios for HTTP, `crypto.randomUUID()` for client-side Idempotency-Key generation.
-- **Infra (target)**: Railway. Single project with web (gunicorn) + worker + beat + Postgres + Redis services. Deploy artefacts (`Procfile`, `runtime.txt`, `nixpacks.toml`) at repo root. Frontend ships as a same-origin SPA — Vite builds with `base: "/static/"`, Django's catch-all serves `index.html`, WhiteNoise serves the hashed assets. See **Deploy** below.
+- **Infra (live)**: **Render free-tier** single web service running gunicorn + Celery worker (with embedded beat via `-B`) as one container, driven by `start.sh` at repo root. **Neon** (Postgres 17, Singapore region) and **Upstash** (Redis 7 with TLS) are the managed data plane. Deploy artefacts (`Procfile`, `runtime.txt`, `nixpacks.toml`, `start.sh`) at repo root — the `Procfile` also defines the 3-service split for Railway / Render-paid deploys, so the same repo deploys both ways. Frontend ships as a same-origin SPA — Vite builds with `base: "/static/"`, Django's catch-all serves `index.html`, WhiteNoise serves the hashed assets. See **Deploy** below.
 
 ---
 
@@ -170,54 +170,94 @@ A CTO grepping the repo for evidence of review discipline should start here.
 
 ---
 
-## Deploy (Railway)
+## Deploy
 
-Live demo: **(set after deploy)**
+Live demo: **<https://playto-rvfx.onrender.com>**
 
-The repo is set up for a single Railway project with three services — `web`, `worker`, `beat` — pulling from the same GitHub repo and sharing a Postgres + Redis pair. All three use the same Nixpacks build (which compiles the React SPA *and* the Python backend into one image); they differ only in start command.
+This repo deploys two ways from the same artefacts. The actual production deploy uses the Render free tier (single-service monolith); the same `Procfile` also describes a 3-service split for Railway / Render-paid / Fly. Both paths are documented below.
 
-### One-time setup
+### How the live demo is shaped
 
-1. **Push to GitHub** if you haven't already.
-2. **Create a new Railway project** and point it at the repo.
-3. Add the **Postgres** and **Redis** plugins. Railway auto-injects `DATABASE_URL` and `REDIS_URL` into every service in the project.
-4. **Create three services**, each pointing at the same repo:
-   - `web` — start command (default from Procfile): `cd backend && gunicorn playto_pay.wsgi --bind 0.0.0.0:$PORT --workers 2 --threads 4 --log-file -`
-   - `worker` — override start command: `cd backend && celery -A playto_pay worker -l info --concurrency=2`
-   - `beat` — override start command: `cd backend && celery -A playto_pay beat -l info`
-5. **Set environment variables** on each service (Postgres + Redis URLs are auto-set by Railway; the rest must be set manually):
+Render's free Web Service tier supports exactly one foreground process bound to `$PORT`. We sidestep that by running the Celery worker (with embedded beat via `-B`) as a *background subprocess* of the same container, while gunicorn stays in the foreground:
 
-   | Variable | `web` | `worker` | `beat` |
-   |---|---|---|---|
-   | `DJANGO_SECRET_KEY` | random ≥50 chars | same | same |
-   | `DJANGO_DEBUG` | `false` | `false` | `false` |
-   | `DJANGO_ALLOWED_HOSTS` | your `*.up.railway.app` host | same | same |
-   | `DJANGO_CSRF_TRUSTED_ORIGINS` | `https://your-app.up.railway.app` | (not used) | (not used) |
-   | `CELERY_BROKER_URL` | `${{REDIS_URL}}/0` | same | same |
-   | `CELERY_RESULT_BACKEND` | `${{REDIS_URL}}/1` | same | same |
-   | `DATABASE_URL` | auto | auto | auto |
-6. **Deploy**. The first deploy will run `release: cd backend && python manage.py migrate --noinput` from the Procfile before any service comes up.
-7. **Seed the production DB** by running `python manage.py seed` against it (Railway's "Run Command" feature, or `railway run python manage.py seed` locally pointing at the prod env).
-8. **Verify the live URL**:
+```
+                   ┌──────────────────────────────────────────────┐
+                   │  ONE Render Web Service (free, 512 MB)       │
+                   │                                              │
+                   │  start.sh:                                   │
+                   │    1. python manage.py migrate --noinput     │
+                   │    2. python manage.py seed                  │
+                   │    3. celery -A playto_pay worker -B &       │  ← background
+                   │    4. exec gunicorn ... --bind 0.0.0.0:$PORT │  ← foreground
+                   └──────────────────────────────────────────────┘
+                              │                       │
+                  ┌───────────┴────────┐  ┌──────────┴───────────┐
+                  ▼                    ▼  ▼                      │
+           Neon Postgres 17       Upstash Redis 7 (rediss:// TLS)
+        (Singapore, 3 GB free)   (10 K cmds/day free)
+```
+
+The `&`-then-`exec` shell idiom is the trick: Render only watches gunicorn (the foreground process); the worker runs alongside, sharing env vars and lifecycle. Beat is embedded inside the worker (`-B` flag) so the retry sweeper + idempotency-key cleanup still fire on schedule.
+
+This is the **deploy-time pragmatic choice the EXPLAINER calls out as a tradeoff**: a paid tier (or Railway / Fly with a worker plan) would split into separate services for independent scaling. Application code is identical either way — splitting is a config change, not a code change.
+
+### Render deploy — recreate the live demo
+
+1. **Push to GitHub** so Render can auto-build on push.
+2. **Provision managed Postgres** at <https://neon.tech> (free, no card). Create a project in your closest region, copy the connection string. Format:
+   ```
+   postgresql://user:pass@host.neon.tech/db?sslmode=require&channel_binding=require
+   ```
+3. **Provision managed Redis** at <https://upstash.com> (free, no card). Create a regional Redis DB, copy the `rediss://...` connection string (TLS-enabled).
+4. **Create a Render Web Service** pointing at the GitHub repo. Free tier is fine.
+   - **Root Directory:** *(empty — repo root)*
+   - **Build Command:**
+     ```
+     cd frontend && npm ci && npm run build && cd ../backend && pip install -r requirements.txt && python manage.py collectstatic --noinput
+     ```
+   - **Start Command:** `./start.sh`
+5. **Set environment variables** in Render's Environment tab. **`?ssl_cert_reqs=CERT_REQUIRED` on the Upstash URLs is mandatory** — Celery 5.4 refuses to initialize a TLS Redis connection without an explicit cert-requirements policy:
+
+   | Variable | Value |
+   |---|---|
+   | `DJANGO_SECRET_KEY` | random ≥50 chars (`python -c "import secrets; print(secrets.token_urlsafe(50))"`) |
+   | `DJANGO_DEBUG` | `false` |
+   | `DJANGO_ALLOWED_HOSTS` | `<your-service>.onrender.com` (no scheme) |
+   | `DJANGO_CSRF_TRUSTED_ORIGINS` | `https://<your-service>.onrender.com` (with scheme) |
+   | `DATABASE_URL` | the Neon connection string (`postgresql://...?sslmode=require&channel_binding=require`) |
+   | `CELERY_BROKER_URL` | `<Upstash rediss URL>/0?ssl_cert_reqs=CERT_REQUIRED` |
+   | `CELERY_RESULT_BACKEND` | `<Upstash rediss URL>/0?ssl_cert_reqs=CERT_REQUIRED` |
+6. **Deploy.** The first build runs `npm ci` + `npm run build` + `pip install` + `collectstatic`. Then `./start.sh` migrates, seeds, and boots the worker + gunicorn. ~5–8 min total.
+7. **Verify the live URL:**
    - `GET /healthz` → `{"status": "ok"}`
    - `GET /api/v1/merchants` → 3 seeded merchants
-   - Open the root URL in a browser → dashboard loads, picking a merchant shows balance / ledger / payout history, submitting a payout runs through the worker.
+   - Open the root URL in a browser → dashboard loads, picking a merchant shows balance + ledger + payout history. Submitting a payout runs through the worker; the row transitions PENDING → PROCESSING → COMPLETED (or FAILED + REFUND) within ~3 seconds.
+
+### Avoiding the cold-start
+
+Render's free tier sleeps after 15 minutes of inactivity. First request after idle is ~30s. Set up a free <https://uptimerobot.com> monitor pinging `/healthz` every 5 minutes — keeps the service warm so the CTO's first click doesn't hit a cold container.
+
+### Railway alternative (3-service split, not used live)
+
+The same `Procfile` defines `release` / `web` / `worker` / `beat` for a 3-service deploy on Railway (paid Hobby plan, $5/mo). The architecture is more "production-correct" — independent scaling per process, no cohabiting subprocesses. Steps:
+
+1. Railway → New Project → Deploy from GitHub.
+2. Add Railway Postgres + Redis plugins (`DATABASE_URL`, `REDIS_URL` auto-injected).
+3. Three services from the same repo:
+   - `web` — uses Procfile's `web:` line (default).
+   - `worker` — override start: `cd backend && celery -A playto_pay worker -l info --concurrency=2`.
+   - `beat` — override start: `cd backend && celery -A playto_pay beat -l info`.
+4. Same env vars as the Render path, except `CELERY_BROKER_URL=${{REDIS_URL}}/0` and `CELERY_RESULT_BACKEND=${{REDIS_URL}}/1` (Railway's Redis isn't TLS-only, so the `?ssl_cert_reqs=...` query param isn't required).
+5. Generate a public domain on the `web` service, paste it into `DJANGO_ALLOWED_HOSTS` / `DJANGO_CSRF_TRUSTED_ORIGINS`.
 
 ### Production hardening that already lives in the code
 
 - **HTTPS-only.** When `DJANGO_DEBUG=false`, `settings.py` sets `SECURE_SSL_REDIRECT`, 1-year HSTS with subdomain inclusion + preload eligibility, secure session + CSRF cookies, `X_FRAME_OPTIONS=DENY`, `Content-Security-Policy`-adjacent referrer policy, and `nosniff`. All gated on `not DEBUG` so dev runs unaffected.
-- **TLS termination behind the proxy.** `SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")` makes Django trust Railway's edge-terminated TLS so `SECURE_SSL_REDIRECT` doesn't loop.
-- **Single-origin SPA + API.** No CORS surface in production — the dashboard and the API share an origin. CORS_ALLOW_ALL_ORIGINS is gated on `DEBUG=true`, so it's *off* in production.
+- **TLS termination behind the proxy.** `SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")` makes Django trust the platform's edge-terminated TLS (Render and Railway both forward this header) so `SECURE_SSL_REDIRECT` doesn't loop.
+- **Single-origin SPA + API.** No CORS surface in production — the dashboard and the API share an origin. `CORS_ALLOW_ALL_ORIGINS` is gated on `DEBUG=true`, so it's *off* in production.
 - **WhiteNoise + manifest static files** with content hashing already configured (`STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"`). Long-cache the JS/CSS, no-cache the SPA shell.
-- **Ephemeral beat schedule** is fine: `CELERY_BEAT_SCHEDULE` is a Python dict in code, not a state file. The persistent-scheduler file at `celerybeat-schedule` rebuilds itself on each restart.
-
-### What still needs your hand
-
-- Connecting the GitHub repo to Railway (account-bound).
-- Setting the env vars listed above in the Railway UI.
-- Picking a Railway hostname and pasting it back into `DJANGO_ALLOWED_HOSTS` and `DJANGO_CSRF_TRUSTED_ORIGINS`.
-- Smoke-testing the live URL with the verification checklist in step 8.
-- Updating "Live demo: …" at the top of this section with the URL.
+- **Ephemeral beat schedule.** `CELERY_BEAT_SCHEDULE` is a Python dict in code, not a state file. The persistent-scheduler file at `celerybeat-schedule` rebuilds itself on each restart, which is fine for our task list (retry sweeper + idempotency cleanup, both idempotent on re-fire).
+- **Neon PgBouncer compatibility.** We do *not* set the libpq `options` startup parameter (e.g. for pinning isolation level) because Neon's transaction-pooled connections reject it. We rely on Postgres's READ COMMITTED default — see EXPLAINER Q2 for the full reasoning + tradeoff.
 
 ---
 
